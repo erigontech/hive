@@ -16,6 +16,7 @@ import (
 type BackendHooks struct {
 	CreateContainer  func(image string, opt libhive.ContainerOptions) (string, error)
 	StartContainer   func(image, containerID string, opt libhive.ContainerOptions) (*libhive.ContainerInfo, error)
+	StopContainer    func(containerID string) error
 	DeleteContainer  func(containerID string) error
 	PauseContainer   func(containerID string) error
 	UnpauseContainer func(containerID string) error
@@ -142,6 +143,13 @@ func (b *fakeBackend) StartContainer(ctx context.Context, containerID string, op
 	}
 	info.Wait = func() {}
 	return &info, nil
+}
+
+func (b *fakeBackend) StopContainer(containerID string) error {
+	if b.hooks.StopContainer != nil {
+		return b.hooks.StopContainer(containerID)
+	}
+	return nil
 }
 
 func (b *fakeBackend) DeleteContainer(containerID string) error {

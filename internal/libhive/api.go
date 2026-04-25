@@ -247,6 +247,20 @@ func (api *simAPI) startClient(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
+	// Compute pool key from the inputs that define a "fresh state" for this
+	// client run. Empty string means pooling is disabled.
+	pool := api.tm.ClientPool()
+	var poolKey string
+	if pool.Enabled() {
+		k, err := ComputePoolKey(clientDef.Image, env, files)
+		if err != nil {
+			slog.Warn("API: pool key computation failed; falling back to fresh container",
+				"client", clientDef.Name, "err", err)
+		} else {
+			poolKey = k
+		}
+	}
+
 	// Create labels for client container.
 	labels := NewBaseLabels(api.tm.hiveInstanceID, api.tm.hiveVersion)
 	labels[LabelHiveType] = ContainerTypeClient
@@ -254,24 +268,42 @@ func (api *simAPI) startClient(w http.ResponseWriter, r *http.Request) {
 	labels[LabelHiveTestCase] = testID.String()
 	labels[LabelHiveClientName] = clientDef.Name
 	labels[LabelHiveClientImage] = clientDef.Image
+	if poolKey != "" {
+		labels[LabelHivePoolKey] = poolKey
+	}
 
 	// Generate container name.
 	containerName := GenerateClientContainerName(clientDef.Name, suiteID, testID)
 
-	// Create the client container.
+	// Create or acquire the client container.
 	options := ContainerOptions{Env: env, Files: files, Labels: labels, Name: containerName}
-	containerID, err := api.backend.CreateContainer(ctx, clientDef.Image, options)
-	if err != nil {
-		slog.Error("API: client container create failed", "client", clientDef.Name, "error", err)
-		err := fmt.Errorf("client container create failed (%v)", err)
-		serveError(w, err, http.StatusInternalServerError)
-		return
+	var containerID string
+	var fromPool bool
+	if poolKey != "" {
+		if id := pool.Acquire(poolKey); id != "" {
+			containerID = id
+			fromPool = true
+			slog.Debug("API: pool hit", "client", clientDef.Name, "container", containerID[:8], "key", shortKey(poolKey))
+		}
+	}
+	if containerID == "" {
+		var err error
+		containerID, err = api.backend.CreateContainer(ctx, clientDef.Image, options)
+		if err != nil {
+			slog.Error("API: client container create failed", "client", clientDef.Name, "error", err)
+			err := fmt.Errorf("client container create failed (%v)", err)
+			serveError(w, err, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// Set the log file. We need the container ID for this,
 	// so it can only be set after creating the container.
 	logPath, logFilePath := api.clientLogFilePaths(clientDef.Name, containerID)
 	options.LogFile = logFilePath
+	// On pool reuse, the log file already contains the previous test's
+	// output — append rather than truncate so it stays readable.
+	options.AppendLog = fromPool
 
 	// Connect to the networks if requested, so it is started already joined to each one.
 	for _, network := range networks {
@@ -327,8 +359,18 @@ func (api *simAPI) startClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Stash the pool key on the registered ClientInfo so EndTest/StopNode
+	// can route this container back to the pool instead of deleting it.
+	if poolKey != "" {
+		api.tm.setClientPoolKey(testID, info.ID, poolKey)
+	}
+
 	// It's started.
-	slog.Info("API: client "+clientDef.Name+" started", "suite", suiteID, "test", testID, "container", containerID[:8])
+	if fromPool {
+		slog.Info("API: client "+clientDef.Name+" started (pool reuse)", "suite", suiteID, "test", testID, "container", containerID[:8])
+	} else {
+		slog.Info("API: client "+clientDef.Name+" started", "suite", suiteID, "test", testID, "container", containerID[:8])
+	}
 	serveJSON(w, &simapi.StartNodeResponse{ID: info.ID, IP: info.IP})
 }
 

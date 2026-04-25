@@ -89,6 +89,11 @@ Otherwise, it looks for files in the $HOME directory:
 			"If a very long chain is imported, this timeout may need to be quite large.\n"+
 			"A lower value means that hive won't wait as long in case the node crashes and\n"+
 			"never opens the RPC port.")
+
+		clientPoolSize = flag.Int("client.pool.size", 0, "Max `number` of stopped client containers retained per (image, env, genesis) bucket\n"+
+			"to be restarted across tests instead of created from scratch. 0 disables pooling.\n"+
+			"The client must support being launched into a previously-initialised datadir, e.g.\n"+
+			"by snapshotting after init (see clients/erigon/erigon.sh).")
 	)
 
 	// Add the sim.buildarg flag multiple times to allow multiple build arguments.
@@ -209,6 +214,7 @@ Otherwise, it looks for files in the $HOME directory:
 		SimRandomSeed:      *simRandomSeed,
 		SimDurationLimit:   *simTimeLimit,
 		ClientStartTimeout: *clientTimeout,
+		ClientPoolSize:     *clientPoolSize,
 	}
 	runner := libhive.NewRunner(inv, builder, cb)
 

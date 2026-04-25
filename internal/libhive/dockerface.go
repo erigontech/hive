@@ -28,6 +28,9 @@ type ContainerBackend interface {
 	// These methods work with containers.
 	CreateContainer(ctx context.Context, image string, opt ContainerOptions) (string, error)
 	StartContainer(ctx context.Context, containerID string, opt ContainerOptions) (*ContainerInfo, error)
+	// StopContainer stops a running container without removing it.
+	// Used by the client pool to retain a container for later reuse.
+	StopContainer(containerID string) error
 	DeleteContainer(containerID string) error
 	PauseContainer(containerID string) error
 	UnpauseContainer(containerID string) error
@@ -66,6 +69,11 @@ type ContainerOptions struct {
 	// options are mutually exclusive.
 	LogFile string
 	Output  io.WriteCloser
+
+	// AppendLog requests that LogFile be opened in append mode rather than
+	// truncated. The client pool sets this when restarting a container so
+	// that earlier tests' logs are preserved.
+	AppendLog bool
 
 	// Input: if set, container stdin draws from the given reader.
 	Input io.ReadCloser

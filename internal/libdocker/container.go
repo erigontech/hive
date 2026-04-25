@@ -219,6 +219,23 @@ func (b *ContainerBackend) DeleteContainer(containerID string) error {
 	return err
 }
 
+// StopContainer stops the given container without removing it. Used by the
+// client pool to keep a stopped container around for later restart.
+//
+// stopGraceSeconds matches the default Docker SIGTERM grace period; we lean
+// short because the test workload has no flush-on-shutdown semantics worth
+// waiting for.
+const stopGraceSeconds = 5
+
+func (b *ContainerBackend) StopContainer(containerID string) error {
+	b.logger.Debug("stopping container", "container", containerID[:8])
+	err := b.client.StopContainer(containerID, stopGraceSeconds)
+	if err != nil {
+		b.logger.Error("can't stop container", "container", containerID[:8], "err", err)
+	}
+	return err
+}
+
 // PauseContainer pauses the given container.
 func (b *ContainerBackend) PauseContainer(containerID string) error {
 	b.logger.Debug("pausing container", "container", containerID[:8])
@@ -395,7 +412,15 @@ func (b *ContainerBackend) runContainer(ctx context.Context, logger *slog.Logger
 		if err := os.MkdirAll(filepath.Dir(opts.LogFile), 0755); err != nil {
 			return nil, err
 		}
-		log, err := os.OpenFile(opts.LogFile, os.O_WRONLY|os.O_CREATE|os.O_SYNC|os.O_TRUNC, 0644)
+		// Append on pool restart so earlier tests' logs aren't truncated;
+		// otherwise truncate to keep fresh-container behaviour unchanged.
+		flags := os.O_WRONLY | os.O_CREATE | os.O_SYNC
+		if opts.AppendLog {
+			flags |= os.O_APPEND
+		} else {
+			flags |= os.O_TRUNC
+		}
+		log, err := os.OpenFile(opts.LogFile, flags, 0644)
 		if err != nil {
 			return nil, err
 		}
