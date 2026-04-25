@@ -275,20 +275,26 @@ func (api *simAPI) startClient(w http.ResponseWriter, r *http.Request) {
 	// Generate container name.
 	containerName := GenerateClientContainerName(clientDef.Name, suiteID, testID)
 
-	// Create or acquire the client container.
+	// Acquire from the pool first. On a hit, the container is already
+	// running with its chain reset to genesis (done at Release time);
+	// we skip CreateContainer + StartContainer entirely.
 	options := ContainerOptions{Env: env, Files: files, Labels: labels, Name: containerName}
-	var containerID string
-	var fromPool bool
+	var (
+		containerID string
+		poolEntry   *PoolEntry
+		fromPool    bool
+	)
 	if poolKey != "" {
-		if id := pool.Acquire(poolKey); id != "" {
-			containerID = id
+		if entry := pool.Acquire(poolKey); entry != nil {
+			containerID = entry.ID
+			poolEntry = entry
 			fromPool = true
 			slog.Debug("API: pool hit", "client", clientDef.Name, "container", containerID[:8], "key", shortKey(poolKey))
 		} else {
 			slog.Debug("API: pool miss", "client", clientDef.Name, "test", testID, "key", shortKey(poolKey))
 		}
 	}
-	if containerID == "" {
+	if !fromPool {
 		var err error
 		containerID, err = api.backend.CreateContainer(ctx, clientDef.Image, options)
 		if err != nil {
@@ -307,12 +313,15 @@ func (api *simAPI) startClient(w http.ResponseWriter, r *http.Request) {
 	// output — append rather than truncate so it stays readable.
 	options.AppendLog = fromPool
 
-	// Connect to the networks if requested, so it is started already joined to each one.
-	for _, network := range networks {
-		if err := api.tm.ConnectContainer(suiteID, network, containerID); err != nil {
-			slog.Error("API: failed to connect container", "network", network, "container", containerID, "error", err)
-			serveError(w, err, http.StatusInternalServerError)
-			return
+	// Connect to the networks if requested. For pool reuse the container
+	// is already on its networks from the original creation, so skip.
+	if !fromPool {
+		for _, network := range networks {
+			if err := api.tm.ConnectContainer(suiteID, network, containerID); err != nil {
+				slog.Error("API: failed to connect container", "network", network, "container", containerID, "error", err)
+				serveError(w, err, http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 
@@ -328,8 +337,24 @@ func (api *simAPI) startClient(w http.ResponseWriter, r *http.Request) {
 		options.CheckLive = uint16(v)
 	}
 
-	// Start it!
-	info, err := api.backend.StartContainer(ctx, containerID, options)
+	// Start it (or, on pool reuse, synthesise a ContainerInfo from the
+	// pool entry — the daemon is already up).
+	var info *ContainerInfo
+	if fromPool {
+		info = &ContainerInfo{
+			ID:      containerID[:8],
+			IP:      poolEntry.IP,
+			LogFile: logFilePath,
+			// No-op wait: the daemon stays up across tests; the container is
+			// only torn down at pool drain, where its original create-time
+			// wait goroutine fires. EndTest only checks for non-nil so any
+			// callable works.
+			Wait: func() {},
+		}
+		err = nil
+	} else {
+		info, err = api.backend.StartContainer(ctx, containerID, options)
+	}
 	if info != nil {
 		// Capture the current log file size as the starting offset for this test.
 		logBegin := logFileSize(logFilePath)

@@ -59,62 +59,88 @@ func (b *recordingBackend) ContainerIP(string, string) (net.IP, error)         {
 func (b *recordingBackend) ConnectContainer(string, string) error              { return nil }
 func (b *recordingBackend) DisconnectContainer(string, string) error           { return nil }
 
+// poolWithStubReset returns a pool whose reset function records calls
+// instead of doing HTTP, so unit tests don't need a live RPC endpoint.
+func poolWithStubReset(t *testing.T, maxPerKey int, resetErr error) (*ClientPool, *recordingBackend, *[]string) {
+	t.Helper()
+	be := &recordingBackend{}
+	p := NewClientPool(be, maxPerKey)
+	var resetIPs []string
+	p.reset = func(ip string) error {
+		resetIPs = append(resetIPs, ip)
+		return resetErr
+	}
+	return p, be, &resetIPs
+}
+
 func TestPoolDisabled(t *testing.T) {
 	be := &recordingBackend{}
 	p := NewClientPool(be, 0)
 	if p.Enabled() {
 		t.Fatal("pool with size 0 should be disabled")
 	}
-	if got := p.Acquire("k"); got != "" {
-		t.Fatalf("disabled pool should return empty on Acquire, got %q", got)
+	if got := p.Acquire("k"); got != nil {
+		t.Fatalf("disabled pool should return nil on Acquire, got %+v", got)
 	}
-	if p.Release("c", "k") {
+	if p.Release(PoolEntry{ID: "c", IP: "1.2.3.4"}, "k") {
 		t.Fatal("disabled pool should not retain on Release")
 	}
 }
 
 func TestPoolAcquireRelease(t *testing.T) {
-	be := &recordingBackend{}
-	p := NewClientPool(be, 2)
+	p, _, resetIPs := poolWithStubReset(t, 2, nil)
 
-	if got := p.Acquire("k"); got != "" {
-		t.Fatalf("empty bucket should return empty, got %q", got)
+	if got := p.Acquire("k"); got != nil {
+		t.Fatalf("empty bucket should return nil, got %+v", got)
 	}
 
-	if !p.Release("c1", "k") {
+	e1 := PoolEntry{ID: "c1", IP: "10.0.0.1"}
+	e2 := PoolEntry{ID: "c2", IP: "10.0.0.2"}
+	e3 := PoolEntry{ID: "c3", IP: "10.0.0.3"}
+	if !p.Release(e1, "k") {
 		t.Fatal("Release into empty bucket should succeed")
 	}
-	if !p.Release("c2", "k") {
+	if !p.Release(e2, "k") {
 		t.Fatal("Release up to capacity should succeed")
 	}
-	if p.Release("c3", "k") {
+	if p.Release(e3, "k") {
 		t.Fatal("Release past capacity should fail")
 	}
 
 	// LIFO: hottest first.
-	if got := p.Acquire("k"); got != "c2" {
-		t.Fatalf("Acquire should return most-recent, got %q", got)
+	if got := p.Acquire("k"); got == nil || got.ID != "c2" {
+		t.Fatalf("Acquire should return most-recent (c2), got %+v", got)
 	}
-	if got := p.Acquire("k"); got != "c1" {
-		t.Fatalf("Acquire should return next, got %q", got)
+	if got := p.Acquire("k"); got == nil || got.ID != "c1" {
+		t.Fatalf("Acquire should return c1 next, got %+v", got)
 	}
-	if got := p.Acquire("k"); got != "" {
-		t.Fatalf("Acquire on drained bucket should return empty, got %q", got)
+	if got := p.Acquire("k"); got != nil {
+		t.Fatalf("Acquire on drained bucket should return nil, got %+v", got)
 	}
 
-	// c3 was rejected on Release; backend should not have stopped it.
-	if len(be.stops) != 2 {
-		t.Fatalf("expected 2 stops (c1,c2), got %v", be.stops)
+	// c1 and c2 were Released successfully; c3 was over capacity and
+	// rejected before reset was attempted.
+	if len(*resetIPs) != 2 {
+		t.Fatalf("expected 2 reset calls (c1, c2), got %v", *resetIPs)
+	}
+}
+
+func TestPoolReleaseFailsOnResetError(t *testing.T) {
+	p, _, _ := poolWithStubReset(t, 4, errStubResetFailed)
+	if p.Release(PoolEntry{ID: "c1", IP: "10.0.0.1"}, "k") {
+		t.Fatal("Release should fail when reset returns an error")
+	}
+	if got := p.Acquire("k"); got != nil {
+		t.Fatalf("nothing should have been parked; got %+v", got)
 	}
 }
 
 func TestPoolDrain(t *testing.T) {
-	be := &recordingBackend{}
-	p := NewClientPool(be, 4)
+	p, be, _ := poolWithStubReset(t, 4, nil)
 
-	p.Release("c1", "k1")
-	p.Release("c2", "k2")
-	p.Release("c3", "k1")
+	p.Release(PoolEntry{ID: "c1", IP: "10.0.0.1"}, "k1")
+	p.Release(PoolEntry{ID: "c2", IP: "10.0.0.2"}, "k2")
+	p.Release(PoolEntry{ID: "c3", IP: "10.0.0.3"}, "k1")
 
 	p.Drain(context.Background())
 
@@ -122,13 +148,19 @@ func TestPoolDrain(t *testing.T) {
 		t.Fatalf("Drain should delete all retained, got %d", len(be.deletes))
 	}
 	// After drain, Acquire is a no-op.
-	if got := p.Acquire("k1"); got != "" {
-		t.Fatalf("Acquire after Drain should return empty, got %q", got)
+	if got := p.Acquire("k1"); got != nil {
+		t.Fatalf("Acquire after Drain should return nil, got %+v", got)
 	}
-	if p.Release("c4", "k1") {
+	if p.Release(PoolEntry{ID: "c4", IP: "10.0.0.4"}, "k1") {
 		t.Fatal("Release after Drain should fail")
 	}
 }
+
+var errStubResetFailed = errStubReset{}
+
+type errStubReset struct{}
+
+func (errStubReset) Error() string { return "stub reset failed" }
 
 func TestComputePoolKeyDeterministic(t *testing.T) {
 	env1 := map[string]string{"HIVE_CHAIN_ID": "1", "HIVE_FORK_HOMESTEAD": "0"}

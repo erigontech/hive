@@ -609,16 +609,21 @@ func (manager *TestManager) EndTest(suiteID TestSuiteID, testID TestID, result *
 }
 
 // disposeClient releases or deletes a client container at the end of a test.
-// If the container has a poolKey set and the pool retains it, we Stop instead
-// of Delete; otherwise the existing remove-and-forget behaviour wins.
+// If the container has a poolKey set and the pool's reset RPC succeeds, the
+// daemon stays up and the container is parked for the next matching test.
+// Otherwise we delete it and call its wait() to clean up the attach goroutine.
 //
-// The wait callback is always cleared once it fires so the container is not
-// double-disposed by Terminate.
+// The wait callback is always cleared so Terminate doesn't try again.
 func (manager *TestManager) disposeClient(c *ClientInfo) {
-	if c.poolKey != "" && manager.clientPool.Release(c.ID, c.poolKey) {
-		c.wait()
-		c.wait = nil
-		return
+	if c.poolKey != "" {
+		entry := PoolEntry{ID: c.ID, IP: c.IP}
+		if manager.clientPool.Release(entry, c.poolKey) {
+			// Warm-daemon path: container keeps running. Don't call wait()
+			// — that would block indefinitely. The original attach goroutine
+			// stays parked until pool Drain calls DeleteContainer at shutdown.
+			c.wait = nil
+			return
+		}
 	}
 	manager.backend.DeleteContainer(c.ID)
 	c.wait()
@@ -694,12 +699,15 @@ func (manager *TestManager) StopNode(testID TestID, nodeID string) error {
 	if !ok {
 		return ErrNoSuchNode
 	}
-	// Stop the container — let disposeClient route to the pool when applicable.
+	// Stop the container — let the pool's reset RPC handle the warm-daemon
+	// path when applicable; otherwise force-remove.
 	if nodeInfo.wait != nil {
-		if nodeInfo.poolKey != "" && manager.clientPool.Release(nodeInfo.ID, nodeInfo.poolKey) {
-			nodeInfo.wait()
-			nodeInfo.wait = nil
-			return nil
+		if nodeInfo.poolKey != "" {
+			entry := PoolEntry{ID: nodeInfo.ID, IP: nodeInfo.IP}
+			if manager.clientPool.Release(entry, nodeInfo.poolKey) {
+				nodeInfo.wait = nil
+				return nil
+			}
 		}
 		if err := manager.backend.DeleteContainer(nodeInfo.ID); err != nil {
 			return fmt.Errorf("unable to stop client: %v", err)
