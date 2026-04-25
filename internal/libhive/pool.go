@@ -144,10 +144,16 @@ func (p *ClientPool) Acquire(key string) *PoolEntry {
 		if entry.key == key {
 			p.list.Remove(e)
 			p.hits++
+			// TRACE-BRANCH: instrumented for offline LRU-size simulation.
+			// Strip before merging upstream.
+			slog.Info("pool.trace", "key", shortID(key), "hit", true, "ts", time.Now().UnixNano())
 			return entry
 		}
 	}
 	p.misses++
+	// TRACE-BRANCH: instrumented for offline LRU-size simulation.
+	// Strip before merging upstream.
+	slog.Info("pool.trace", "key", shortID(key), "hit", false, "ts", time.Now().UnixNano())
 	return nil
 }
 
