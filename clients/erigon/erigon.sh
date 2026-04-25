@@ -45,7 +45,6 @@ set -e
 erigon=/usr/local/bin/erigon
 
 DATADIR=/erigon-hive-datadir
-SNAPSHOT_DIR=/erigon-hive-datadir.snap
 
 if [ "$HIVE_LOGLEVEL" != "" ]; then
     FLAGS="$FLAGS --log.console.verbosity=$HIVE_LOGLEVEL"
@@ -69,69 +68,65 @@ else
     FLAGS="$FLAGS --networkid 1337"
 fi
 
-if [ -d "$SNAPSHOT_DIR" ]; then
-    # Pool-reuse path: restore the datadir from the snapshot saved on the
-    # first invocation. cp -a preserves permissions/timestamps; for a
-    # fresh genesis the datadir is just a few MB so this is fast.
-    rm -rf "$DATADIR"
-    cp -a "$SNAPSHOT_DIR" "$DATADIR"
-    echo "[hive-pool] datadir restored from snapshot"
-else
-    # First invocation: run the full init/import sequence and snapshot
-    # the result for any pool-reuse runs that follow.
-    mkdir "$DATADIR"
+# Idempotent setup so this script works both for fresh containers and for
+# pool-reuse restarts (where /genesis.json may already have been consumed
+# and the datadir already populated). For pool reuse, hive guarantees the
+# pool key (image + env + genesis bytes) matches the first invocation, so
+# re-running init produces a byte-identical state.
+rm -rf "$DATADIR"
+mkdir "$DATADIR"
 
-    # Configure the chain.
-    mv /genesis.json /genesis-input.json
-    jq -f /mapper.jq /genesis-input.json > /genesis.json
-
-    # Dump genesis.
-    if [ "$HIVE_LOGLEVEL" -lt 4 ]; then
-        echo "Supplied genesis state (trimmed, use --sim.loglevel 4 or 5 for full output):"
-        jq 'del(.alloc[] | select(.balance == "0x123450000000000000000"))' /genesis.json
-    else
-        echo "Supplied genesis state:"
-        cat /genesis.json
+# Convert genesis once and cache the converted form, since the original
+# `mv /genesis.json /genesis-input.json` would lose the source on restart.
+if [ ! -f /genesis-converted.json ]; then
+    if [ ! -f /genesis.json ]; then
+        echo "[hive-pool] no /genesis.json or /genesis-converted.json found"
+        exit 1
     fi
-
-    echo "Command flags till now:"
-    echo $FLAGS
-
-    # Initialize the local testchain with the genesis state
-    echo "Initializing database with genesis state..."
-    $erigon $FLAGS init /genesis.json
-
-    # Don't immediately abort, some imports are meant to fail
-    set +e
-
-    # Load the test chain if present
-    echo "Loading initial blockchain..."
-    if [ -f /chain.rlp ]; then
-        echo "Loading initial blockchain..."
-        $erigon $FLAGS import /chain.rlp
-    else
-        echo "Warning: chain.rlp not found."
-    fi
-
-    # Load the remainder of the test chain
-    echo "Loading remaining individual blocks..."
-    if [ -d /blocks ]; then
-        echo "Loading remaining individual blocks..."
-        for file in $(ls /blocks | sort -n); do
-            echo "Importing " $file
-            $erigon $FLAGS import /blocks/$file
-        done
-    else
-        echo "Warning: blocks folder not found."
-    fi
-
-    set -e
-
-    # Snapshot the post-init datadir so subsequent pool-reuse runs can
-    # skip init. Done after chain imports so they are part of the warm state.
-    cp -a "$DATADIR" "$SNAPSHOT_DIR"
-    echo "[hive-pool] saved init snapshot to $SNAPSHOT_DIR"
+    jq -f /mapper.jq /genesis.json > /genesis-converted.json
 fi
+
+# Dump genesis.
+if [ "$HIVE_LOGLEVEL" -lt 4 ]; then
+    echo "Supplied genesis state (trimmed, use --sim.loglevel 4 or 5 for full output):"
+    jq 'del(.alloc[] | select(.balance == "0x123450000000000000000"))' /genesis-converted.json
+else
+    echo "Supplied genesis state:"
+    cat /genesis-converted.json
+fi
+
+echo "Command flags till now:"
+echo $FLAGS
+
+# Initialize the local testchain with the genesis state
+echo "Initializing database with genesis state..."
+$erigon $FLAGS init /genesis-converted.json
+
+# Don't immediately abort, some imports are meant to fail
+set +e
+
+# Load the test chain if present
+echo "Loading initial blockchain..."
+if [ -f /chain.rlp ]; then
+    echo "Loading initial blockchain..."
+    $erigon $FLAGS import /chain.rlp
+else
+    echo "Warning: chain.rlp not found."
+fi
+
+# Load the remainder of the test chain
+echo "Loading remaining individual blocks..."
+if [ -d /blocks ]; then
+    echo "Loading remaining individual blocks..."
+    for file in $(ls /blocks | sort -n); do
+        echo "Importing " $file
+        $erigon $FLAGS import /blocks/$file
+    done
+else
+    echo "Warning: blocks folder not found."
+fi
+
+set -e
 
 # Configure any mining operation
 # TODO: Erigon doesn't have inbuilt cpu miner. Need to add https://github.com/panglove/ethcpuminer/tree/master/ethash for cpu mining with erigon

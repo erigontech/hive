@@ -222,16 +222,15 @@ func (b *ContainerBackend) DeleteContainer(containerID string) error {
 // StopContainer stops the given container without removing it. Used by the
 // client pool to keep a stopped container around for later restart.
 //
-// stopGraceSeconds matches the default Docker SIGTERM grace period; we lean
-// short because the test workload has no flush-on-shutdown semantics worth
-// waiting for.
-const stopGraceSeconds = 5
-
+// We use SIGKILL directly: client containers in EEST tests have no flush-
+// on-shutdown semantics worth waiting for, and Erigon in particular does not
+// respond promptly to SIGTERM in this configuration. The default 10s SIGTERM
+// grace would inflate every pool-release by an order of magnitude.
 func (b *ContainerBackend) StopContainer(containerID string) error {
-	b.logger.Debug("stopping container", "container", containerID[:8])
-	err := b.client.StopContainer(containerID, stopGraceSeconds)
+	b.logger.Debug("killing container", "container", containerID[:8])
+	err := b.client.KillContainer(docker.KillContainerOptions{ID: containerID})
 	if err != nil {
-		b.logger.Error("can't stop container", "container", containerID[:8], "err", err)
+		b.logger.Error("can't kill container", "container", containerID[:8], "err", err)
 	}
 	return err
 }

@@ -30,6 +30,12 @@ type ClientPool struct {
 	idle        map[string][]string // pool key -> container IDs (LIFO)
 	knownByID   map[string]string   // container ID -> pool key (so cleanup knows what's pooled)
 	closed      bool
+
+	// Counters for end-of-run summary.
+	hits      uint64
+	misses    uint64
+	released  uint64
+	rejected  uint64 // Releases dropped (bucket full or stop failed)
 }
 
 // NewClientPool returns a pool that holds at most maxPerKey idle containers
@@ -116,12 +122,14 @@ func (p *ClientPool) Acquire(key string) string {
 	}
 	bucket := p.idle[key]
 	if len(bucket) == 0 {
+		p.misses++
 		return ""
 	}
 	// LIFO: hottest container first (least likely to have been swapped out).
 	id := bucket[len(bucket)-1]
 	p.idle[key] = bucket[:len(bucket)-1]
 	delete(p.knownByID, id)
+	p.hits++
 	return id
 }
 
@@ -138,15 +146,18 @@ func (p *ClientPool) Release(containerID, key string) bool {
 		return false
 	}
 	if len(p.idle[key]) >= p.maxPerKey {
+		p.rejected++
 		return false
 	}
 	if err := p.backend.StopContainer(containerID); err != nil {
 		// Best-effort: if the stop fails the caller will fall back to delete.
 		slog.Warn("pool: stop failed, not retaining", "container", containerID[:8], "err", err)
+		p.rejected++
 		return false
 	}
 	p.idle[key] = append(p.idle[key], containerID)
 	p.knownByID[containerID] = key
+	p.released++
 	return true
 }
 
@@ -170,9 +181,23 @@ func (p *ClientPool) Drain(ctx context.Context) {
 	p.mu.Lock()
 	p.closed = true
 	all := p.idle
+	hits, misses, released, rejected := p.hits, p.misses, p.released, p.rejected
 	p.idle = nil
 	p.knownByID = nil
 	p.mu.Unlock()
+
+	totalAcquires := hits + misses
+	hitRate := 0.0
+	if totalAcquires > 0 {
+		hitRate = 100 * float64(hits) / float64(totalAcquires)
+	}
+	slog.Info("pool: summary",
+		"hits", hits,
+		"misses", misses,
+		"hit_rate_pct", fmt.Sprintf("%.1f", hitRate),
+		"released", released,
+		"rejected", rejected,
+	)
 
 	for key, ids := range all {
 		for _, id := range ids {

@@ -284,6 +284,8 @@ func (api *simAPI) startClient(w http.ResponseWriter, r *http.Request) {
 			containerID = id
 			fromPool = true
 			slog.Debug("API: pool hit", "client", clientDef.Name, "container", containerID[:8], "key", shortKey(poolKey))
+		} else {
+			slog.Debug("API: pool miss", "client", clientDef.Name, "test", testID, "key", shortKey(poolKey))
 		}
 	}
 	if containerID == "" {
