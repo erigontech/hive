@@ -87,8 +87,9 @@ func TestPoolDisabled(t *testing.T) {
 	}
 }
 
-func TestPoolAcquireRelease(t *testing.T) {
-	p, _, resetIPs := poolWithStubReset(t, 2, nil)
+func TestPoolAcquireReleaseLIFO(t *testing.T) {
+	// Pool fits all 3 entries; verify Acquire returns LIFO within bucket.
+	p, _, resetIPs := poolWithStubReset(t, 4, nil)
 
 	if got := p.Acquire("k"); got != nil {
 		t.Fatalf("empty bucket should return nil, got %+v", got)
@@ -97,31 +98,91 @@ func TestPoolAcquireRelease(t *testing.T) {
 	e1 := PoolEntry{ID: "c1", IP: "10.0.0.1"}
 	e2 := PoolEntry{ID: "c2", IP: "10.0.0.2"}
 	e3 := PoolEntry{ID: "c3", IP: "10.0.0.3"}
-	if !p.Release(e1, "k") {
-		t.Fatal("Release into empty bucket should succeed")
-	}
-	if !p.Release(e2, "k") {
-		t.Fatal("Release up to capacity should succeed")
-	}
-	if p.Release(e3, "k") {
-		t.Fatal("Release past capacity should fail")
+	for _, e := range []PoolEntry{e1, e2, e3} {
+		if !p.Release(e, "k") {
+			t.Fatalf("Release of %s should succeed under cap", e.ID)
+		}
 	}
 
-	// LIFO: hottest first.
+	if got := p.Acquire("k"); got == nil || got.ID != "c3" {
+		t.Fatalf("Acquire should return most-recent (c3), got %+v", got)
+	}
 	if got := p.Acquire("k"); got == nil || got.ID != "c2" {
-		t.Fatalf("Acquire should return most-recent (c2), got %+v", got)
+		t.Fatalf("Acquire should return c2 next, got %+v", got)
 	}
 	if got := p.Acquire("k"); got == nil || got.ID != "c1" {
-		t.Fatalf("Acquire should return c1 next, got %+v", got)
+		t.Fatalf("Acquire should return c1 last, got %+v", got)
 	}
 	if got := p.Acquire("k"); got != nil {
 		t.Fatalf("Acquire on drained bucket should return nil, got %+v", got)
 	}
 
-	// c1 and c2 were Released successfully; c3 was over capacity and
-	// rejected before reset was attempted.
-	if len(*resetIPs) != 2 {
-		t.Fatalf("expected 2 reset calls (c1, c2), got %v", *resetIPs)
+	if len(*resetIPs) != 3 {
+		t.Fatalf("expected 3 reset calls, got %v", *resetIPs)
+	}
+}
+
+// TestPoolGlobalCapEvictsOldest verifies that when the global cap is hit,
+// the oldest LRU entry (across all buckets) is evicted on the next Release,
+// not the new entry being parked. This is the property that prevents the
+// container-count blowup observed in CI run 24930111125.
+func TestPoolGlobalCapEvictsOldest(t *testing.T) {
+	p, be, _ := poolWithStubReset(t, 2, nil)
+
+	// Park 2 entries to fill the global cap.
+	if !p.Release(PoolEntry{ID: "c1", IP: "10.0.0.1"}, "k1") {
+		t.Fatal("first release must succeed")
+	}
+	if !p.Release(PoolEntry{ID: "c2", IP: "10.0.0.2"}, "k2") {
+		t.Fatal("second release must succeed under cap")
+	}
+	if got := len(be.deletes); got != 0 {
+		t.Fatalf("no evictions yet, got %d deletes", got)
+	}
+
+	// Park a 3rd: evicts c1 (oldest in LRU) to make room.
+	if !p.Release(PoolEntry{ID: "c3", IP: "10.0.0.3"}, "k3") {
+		t.Fatal("Release should succeed by evicting oldest")
+	}
+	if got := be.deletes; len(got) != 1 || got[0] != "c1" {
+		t.Fatalf("expected c1 to be evicted, got %v", got)
+	}
+
+	// c1's bucket k1 should now be empty.
+	if got := p.Acquire("k1"); got != nil {
+		t.Fatalf("k1 bucket should be empty after eviction, got %+v", got)
+	}
+	// c2 and c3 are still parked.
+	if got := p.Acquire("k2"); got == nil || got.ID != "c2" {
+		t.Fatalf("k2 should still hold c2, got %+v", got)
+	}
+	if got := p.Acquire("k3"); got == nil || got.ID != "c3" {
+		t.Fatalf("k3 should still hold c3, got %+v", got)
+	}
+}
+
+// TestPoolAcquireRefreshesLRU verifies that Acquire-ing an entry and
+// re-Releasing it makes it the *newest* in the LRU, so future evictions
+// favour entries that haven't been touched recently.
+func TestPoolAcquireRefreshesLRU(t *testing.T) {
+	p, be, _ := poolWithStubReset(t, 2, nil)
+
+	p.Release(PoolEntry{ID: "c1", IP: "10.0.0.1"}, "k1")
+	p.Release(PoolEntry{ID: "c2", IP: "10.0.0.2"}, "k2")
+
+	// Acquire and re-Release c1 — that pushes it to the back of the LRU.
+	got := p.Acquire("k1")
+	if got == nil || got.ID != "c1" {
+		t.Fatalf("Acquire k1 should return c1, got %+v", got)
+	}
+	if !p.Release(*got, "k1") {
+		t.Fatal("Re-release of c1 should succeed")
+	}
+
+	// Park c3: evict the *new* oldest, which is now c2 (not c1).
+	p.Release(PoolEntry{ID: "c3", IP: "10.0.0.3"}, "k3")
+	if got := be.deletes; len(got) != 1 || got[0] != "c2" {
+		t.Fatalf("expected c2 to be evicted (older after c1 was refreshed), got %v", got)
 	}
 }
 

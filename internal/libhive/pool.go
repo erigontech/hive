@@ -2,6 +2,7 @@ package libhive
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -39,6 +40,17 @@ type PoolEntry struct {
 	IP string
 }
 
+// poolNode wires a single PoolEntry into both per-bucket order (for LIFO
+// "hottest first" Acquire) and global LRU order (for eviction when the
+// global cap is reached). Each entry has its own *list.Element in each
+// list, stored here so we can remove the entry from both sides in O(1).
+type poolNode struct {
+	entry    PoolEntry
+	key      string        // bucket key
+	bucketEl *list.Element // position in idle[key]
+	lruEl    *list.Element // position in lru
+}
+
 // ClientPool retains running client containers across tests. After a
 // test ends, instead of stopping/removing the container, we send a
 // JSON-RPC `debug_setHead(0)` to revert the chain to genesis and park
@@ -46,36 +58,49 @@ type PoolEntry struct {
 // matches the key reuses the already-running daemon — no docker
 // create/start, no `erigon init`, no daemon boot.
 //
+// Because every parked container holds a live daemon (~150 MB RAM),
+// the pool enforces a *global* idle cap: --client.pool.size sets the
+// maximum number of idle containers across all buckets, not per
+// bucket. When a Release would exceed the cap the oldest idle entry
+// in the LRU is evicted (DeleteContainer) to make room. This stops
+// low-reuse workloads (e.g. paris+shanghai with ~3500 unique pre-
+// states) from accumulating thousands of running daemons and
+// exhausting the docker daemon.
+//
 // The pool is opt-in via --client.pool.size. When size <= 0, all pool
 // methods are no-ops and Acquire returns nothing.
 type ClientPool struct {
-	backend   ContainerBackend
-	maxPerKey int
+	backend ContainerBackend
+	maxIdle int
 	// reset performs the chain-state reset on a parked container. The
 	// default implementation sends debug_setHead(0) to ip:8545; tests
 	// override it to avoid needing a live HTTP endpoint.
-	reset     func(ip string) error
+	reset func(ip string) error
+
 	mu        sync.Mutex
-	idle      map[string][]PoolEntry // pool key -> entries (LIFO)
-	knownByID map[string]string      // container ID -> pool key
+	idle      map[string]*list.List // pool key -> list of *poolNode (LIFO)
+	lru       *list.List            // *poolNode in LRU order; front = oldest
+	knownByID map[string]string     // container ID -> pool key
 	closed    bool
 
 	// Counters for end-of-run summary.
 	hits        uint64
 	misses      uint64
 	released    uint64
-	rejected    uint64 // Releases dropped (bucket full or reset failed)
+	rejected    uint64 // Releases dropped (reset failed or pool closed)
+	evicted     uint64 // Entries evicted to make room for newer ones
 	resetFailed uint64
 }
 
-// NewClientPool returns a pool that holds at most maxPerKey idle
-// containers per (image, env, genesis) bucket. maxPerKey <= 0 disables
-// the pool entirely; in that mode every method is a cheap no-op.
-func NewClientPool(backend ContainerBackend, maxPerKey int) *ClientPool {
+// NewClientPool returns a pool that holds at most maxIdle idle
+// containers globally. maxIdle <= 0 disables the pool entirely; in
+// that mode every method is a cheap no-op.
+func NewClientPool(backend ContainerBackend, maxIdle int) *ClientPool {
 	p := &ClientPool{
 		backend:   backend,
-		maxPerKey: maxPerKey,
-		idle:      make(map[string][]PoolEntry),
+		maxIdle:   maxIdle,
+		idle:      make(map[string]*list.List),
+		lru:       list.New(),
 		knownByID: make(map[string]string),
 	}
 	p.reset = p.defaultReset
@@ -84,7 +109,7 @@ func NewClientPool(backend ContainerBackend, maxPerKey int) *ClientPool {
 
 // Enabled reports whether pooling is active.
 func (p *ClientPool) Enabled() bool {
-	return p != nil && p.maxPerKey > 0
+	return p != nil && p.maxIdle > 0
 }
 
 // ComputePoolKey produces a stable hash over the inputs that determine
@@ -154,36 +179,38 @@ func (p *ClientPool) Acquire(key string) *PoolEntry {
 		return nil
 	}
 	bucket := p.idle[key]
-	if len(bucket) == 0 {
+	if bucket == nil || bucket.Len() == 0 {
 		p.misses++
 		return nil
 	}
-	// LIFO: hottest entry first (most recently reset, warmest caches).
-	entry := bucket[len(bucket)-1]
-	p.idle[key] = bucket[:len(bucket)-1]
-	delete(p.knownByID, entry.ID)
+	// LIFO within bucket: hottest container first.
+	bucketBack := bucket.Back()
+	node := bucketBack.Value.(*poolNode)
+	bucket.Remove(bucketBack)
+	if bucket.Len() == 0 {
+		delete(p.idle, key)
+	}
+	p.lru.Remove(node.lruEl)
+	delete(p.knownByID, node.entry.ID)
 	p.hits++
+	entry := node.entry
 	return &entry
 }
 
 // Release sends a debug_setHead(0) RPC to the running daemon to reset
-// the chain to genesis, then parks the entry in the bucket for key.
-// On RPC failure or full bucket the caller is told to fall back to
-// delete by a `false` return.
+// the chain to genesis, then parks the entry. If the global idle cap
+// would be exceeded, the oldest entry in the LRU is evicted
+// (DeleteContainer) to make room.
+//
+// On RPC failure, returns false and the caller is expected to delete
+// the container.
 func (p *ClientPool) Release(entry PoolEntry, key string) bool {
 	if !p.Enabled() || entry.ID == "" || entry.IP == "" || key == "" {
 		return false
 	}
 
-	// Bucket fullness check is racy with the reset RPC, but the worst
-	// case is wasted reset work — never an inconsistent pool state.
 	p.mu.Lock()
 	if p.closed {
-		p.mu.Unlock()
-		return false
-	}
-	if len(p.idle[key]) >= p.maxPerKey {
-		p.rejected++
 		p.mu.Unlock()
 		return false
 	}
@@ -208,15 +235,54 @@ func (p *ClientPool) Release(entry PoolEntry, key string) bool {
 		// Race: pool was drained while we were resetting. Caller deletes.
 		return false
 	}
-	if len(p.idle[key]) >= p.maxPerKey {
-		// Race: bucket filled while we were resetting.
-		p.rejected++
-		return false
+
+	// Evict the oldest LRU entry until we're under cap. Each eviction
+	// triggers a DeleteContainer which blocks the lock briefly; we keep
+	// the cap small (typically ~12-30) so this is bounded.
+	for p.lru.Len() >= p.maxIdle {
+		oldest := p.lru.Front()
+		if oldest == nil {
+			break // shouldn't happen but guard anyway
+		}
+		p.evictNode(oldest.Value.(*poolNode))
+		p.evicted++
 	}
-	p.idle[key] = append(p.idle[key], entry)
+
+	// Park the new entry: append to bucket (LIFO from back) and tail
+	// of LRU (newest = back).
+	bucket, ok := p.idle[key]
+	if !ok {
+		bucket = list.New()
+		p.idle[key] = bucket
+	}
+	node := &poolNode{entry: entry, key: key}
+	node.bucketEl = bucket.PushBack(node)
+	node.lruEl = p.lru.PushBack(node)
 	p.knownByID[entry.ID] = key
 	p.released++
 	return true
+}
+
+// evictNode removes an entry from both the bucket list and the LRU
+// list, then DeleteContainer on the underlying container. Caller must
+// hold p.mu.
+func (p *ClientPool) evictNode(node *poolNode) {
+	bucket := p.idle[node.key]
+	if bucket != nil {
+		bucket.Remove(node.bucketEl)
+		if bucket.Len() == 0 {
+			delete(p.idle, node.key)
+		}
+	}
+	p.lru.Remove(node.lruEl)
+	delete(p.knownByID, node.entry.ID)
+	// DeleteContainer is best-effort. Releasing the lock for it would
+	// complicate the eviction loop; the call is fast (~50ms force-rm)
+	// and rare in steady state.
+	if err := p.backend.DeleteContainer(node.entry.ID); err != nil {
+		slog.Warn("pool: evict delete failed",
+			"container", shortID(node.entry.ID), "key", shortKey(node.key), "err", err)
+	}
 }
 
 // defaultReset calls debug_setHead(0) on the client's standard JSON-RPC
@@ -282,9 +348,20 @@ func (p *ClientPool) Drain(ctx context.Context) {
 	}
 	p.mu.Lock()
 	p.closed = true
-	all := p.idle
-	hits, misses, released, rejected, resetFailed := p.hits, p.misses, p.released, p.rejected, p.resetFailed
+	allKeys := make([]string, 0, len(p.idle))
+	for k := range p.idle {
+		allKeys = append(allKeys, k)
+	}
+	hits, misses, released, rejected, evicted, resetFailed :=
+		p.hits, p.misses, p.released, p.rejected, p.evicted, p.resetFailed
+	type victim struct{ id, key string }
+	victims := make([]victim, 0, p.lru.Len())
+	for e := p.lru.Front(); e != nil; e = e.Next() {
+		n := e.Value.(*poolNode)
+		victims = append(victims, victim{id: n.entry.ID, key: n.key})
+	}
 	p.idle = nil
+	p.lru = list.New()
 	p.knownByID = nil
 	p.mu.Unlock()
 
@@ -298,17 +375,23 @@ func (p *ClientPool) Drain(ctx context.Context) {
 		"misses", misses,
 		"hit_rate_pct", fmt.Sprintf("%.1f", hitRate),
 		"released", released,
+		"evicted", evicted,
 		"rejected", rejected,
 		"reset_failed", resetFailed,
 	)
 
-	for key, entries := range all {
-		for _, e := range entries {
-			if err := p.backend.DeleteContainer(e.ID); err != nil {
-				slog.Warn("pool drain: delete failed", "container", shortID(e.ID), "key", shortKey(key), "err", err)
-			}
+	for _, v := range victims {
+		if err := p.backend.DeleteContainer(v.id); err != nil {
+			slog.Warn("pool drain: delete failed", "container", shortID(v.id), "key", shortKey(v.key), "err", err)
 		}
 	}
+}
+
+func shortKey(k string) string {
+	if len(k) > 12 {
+		return k[:12]
+	}
+	return k
 }
 
 // shortID truncates a container ID to its first 8 characters for logs.
@@ -318,13 +401,6 @@ func shortID(id string) string {
 		return id[:8]
 	}
 	return id
-}
-
-func shortKey(k string) string {
-	if len(k) > 12 {
-		return k[:12]
-	}
-	return k
 }
 
 // EnvFingerprint returns a short, human-readable summary of an env map,
