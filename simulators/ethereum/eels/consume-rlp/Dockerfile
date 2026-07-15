@@ -28,11 +28,14 @@ RUN uv sync
 # `Dockerfile` anchor keeps COPY from failing when no tarball is staged.
 # Extraction is additionally gated on fixtures=/fixtures so that a staged
 # tarball without the matching build arg doesn't silently bloat the image.
+# --strip-components=1 drops the tarball's top-level fixtures/ dir (official
+# EEST release layout) so the shipped .meta/index.json lands where consume
+# expects it and index regeneration is skipped.
 FROM base AS fixtures-stage
 COPY Dockerfile fixtures.tar.gz* /staged/
 RUN mkdir -p /fixtures && \
     if [ "$FIXTURES" = "/fixtures" ] && [ -f /staged/fixtures.tar.gz ]; then \
-        tar -xzf /staged/fixtures.tar.gz -C /fixtures; \
+        tar -xzf /staged/fixtures.tar.gz -C /fixtures --strip-components=1; \
     fi
 
 FROM base
