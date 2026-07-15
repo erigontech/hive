@@ -20,17 +20,13 @@ RUN git clone --depth 1 https://github.com/ethereum/execution-specs.git && \
 WORKDIR /execution-specs/packages/testing
 RUN uv sync
 
-# Optionally bake pre-staged fixtures into the image so `consume` reads them
-# locally instead of downloading. A caller that stages ./fixtures.tar.gz and
-# passes fixtures=/fixtures gets the local fixtures; otherwise FIXTURES stays a
-# release/URL and consume downloads as before. Extraction runs in a throwaway
-# stage so the tarball never lands in the final image (no size doubling); the
-# `Dockerfile` anchor keeps COPY from failing when no tarball is staged.
-# Extraction is additionally gated on fixtures=/fixtures so that a staged
-# tarball without the matching build arg doesn't silently bloat the image.
-# --strip-components=1 drops the tarball's top-level fixtures/ dir (official
-# EEST release layout) so the shipped .meta/index.json lands where consume
-# expects it and index regeneration is skipped.
+# Optionally bake pre-staged fixtures into the image: stage ./fixtures.tar.gz
+# and pass fixtures=/fixtures to have `consume` read them locally; otherwise
+# FIXTURES stays a release/URL and is downloaded as before. The throwaway
+# stage keeps the tarball out of the final image; the fixtures=/fixtures gate
+# keeps a staged-but-unused tarball from bloating it; the `Dockerfile` anchor
+# lets COPY succeed when nothing is staged; --strip-components=1 drops the
+# tarball's top-level dir (EEST release layout) so the shipped index is reused.
 FROM base AS fixtures-stage
 COPY Dockerfile fixtures.tar.gz* /staged/
 RUN mkdir -p /fixtures && \
@@ -41,10 +37,9 @@ RUN mkdir -p /fixtures && \
 FROM base
 COPY --from=fixtures-stage /fixtures /fixtures
 
-# Cache the fixtures. This is done to avoid re-downloading the fixtures every time
-# the container starts.
-# If newer version of the fixtures is needed, the image needs to be rebuilt.
-# Use `--docker.nocache` flag to force rebuild.
+# Cache the fixtures at build time so container starts don't re-download them
+# (for pre-staged fixtures this only validates them and reuses the shipped
+# index). Rebuild the image (`--docker.nocache`) to pick up newer fixtures.
 RUN uv run consume cache --input "$FIXTURES"
 
 
