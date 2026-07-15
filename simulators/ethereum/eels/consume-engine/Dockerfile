@@ -26,10 +26,14 @@ RUN uv sync
 # release/URL and consume downloads as before. Extraction runs in a throwaway
 # stage so the tarball never lands in the final image (no size doubling); the
 # `Dockerfile` anchor keeps COPY from failing when no tarball is staged.
+# Extraction is additionally gated on fixtures=/fixtures so that a staged
+# tarball without the matching build arg doesn't silently bloat the image.
 FROM base AS fixtures-stage
 COPY Dockerfile fixtures.tar.gz* /staged/
 RUN mkdir -p /fixtures && \
-    if [ -f /staged/fixtures.tar.gz ]; then tar -xzf /staged/fixtures.tar.gz -C /fixtures; fi
+    if [ "$FIXTURES" = "/fixtures" ] && [ -f /staged/fixtures.tar.gz ]; then \
+        tar -xzf /staged/fixtures.tar.gz -C /fixtures; \
+    fi
 
 FROM base
 COPY --from=fixtures-stage /fixtures /fixtures
