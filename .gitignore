@@ -20,3 +20,6 @@ __pycache__/
 simulators/**/target
 hivesim-rs/Cargo.lock
 hivesim-rs/target
+
+# pre-staged local fixtures for the eels simulators
+simulators/ethereum/eels/*/fixtures.tar.gz
